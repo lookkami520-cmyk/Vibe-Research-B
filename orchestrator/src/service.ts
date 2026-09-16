@@ -31,6 +31,7 @@ import { REGISTRY_REL, buildStagePlan, fetchArgv, loadRegistry, type EndpointDef
 import { productVersion } from "./version.ts";
 import { DEFAULT_CONSISTENCY, readSnapshot, snapshotKey, snapshotUsable, writeSnapshot, type Consistency } from "./snapshot.ts";
 import { currentPlugin } from "./plugin.ts";
+import { assessFetchQuality, fetchMetricsSnapshot, recordFetchMetric, type FetchQuality } from "./fetch_metrics.ts";
 import { ReportLibraryError, addReport, listReports as listStoredReports, removeReport, reportCitationErrors, reportCitations, reportContextAsync, reportFile, reportRecallPlan, reportText, type ReportRecord } from "./report_library.ts";
 import { GuidedToolError, guidedToolTurn as guidedToolTurnCore, type GuidedToolReply } from "./guided_tool.ts";
 import { LocalAgentError, probeClaude, probeCodeBuddy, probeCodex, startCodexLogin, type LocalAgentStatus } from "./local_agent_runtime.ts";
@@ -201,6 +202,8 @@ export interface FetchResult {
   cached: boolean;
   /** 这份数据是什么时候取到的。**界面必须显示它** —— 拿旧数据不说是旧的等于骗人 */
   fetched_at: string;
+  /** Per-response diagnostics for UI and monitoring; never replaces the source envelope status. */
+  quality: FetchQuality;
 }
 
 /**
@@ -250,7 +253,12 @@ export async function fetchEndpoint(
   const epMaxAge = typeof ep.cache_max_age_sec === "number" ? ep.cache_max_age_sec * 1000 : null;
   const hit = readSnapshot<FetchResult>(ctx.dataRoot, snapKey);
   if (snapshotUsable(hit, consistency, epMaxAge)) {
-    return { ...(hit as NonNullable<typeof hit>).payload, cached: true, fetched_at: (hit as NonNullable<typeof hit>).fetched_at };
+    const payload = (hit as NonNullable<typeof hit>).payload;
+    const quality = payload.quality ?? assessFetchQuality(payload.envelope, 0);
+    const result = { ...payload, quality, cached: true, fetched_at: (hit as NonNullable<typeof hit>).fetched_at };
+    const env = result.envelope as { status?: unknown; evidence?: unknown };
+    recordFetchMetric(ctx.dataRoot, ep.id, { cached: true, ok: result.exit_code === 0 && env.status !== "failed" && Array.isArray(env.evidence) && env.evidence.length > 0, latency_ms: 0, quality });
+    return result;
   }
   if (consistency.mode === "cache_only") {
     throw new ServiceError("no_snapshot", `端点 ${ep.id} 没有可用快照,而本次要求只读缓存(不联网)`);
@@ -284,7 +292,10 @@ export async function fetchEndpoint(
     let envelope: Record<string, unknown>;
     try { envelope = JSON.parse(p.stdout) as Record<string, unknown>; }
     catch { throw new ServiceError("bad_envelope", `取数器未输出合法 JSON(退出码 ${p.status}):${redact(p.stderr || "", 200)}`); }
-    const result: FetchResult = { envelope, exit_code: p.status, out_dir: rel(ctx, outDir), duration_ms: dur, stderr_tail: redact(p.stderr || "", 300), cached: false, fetched_at: nowIso() };
+    const quality = assessFetchQuality(envelope, dur);
+    const result: FetchResult = { envelope, exit_code: p.status, out_dir: rel(ctx, outDir), duration_ms: dur, stderr_tail: redact(p.stderr || "", 300), cached: false, fetched_at: nowIso(), quality };
+    const env = envelope as { status?: unknown; evidence?: unknown };
+    recordFetchMetric(ctx.dataRoot, ep.id, { cached: false, ok: p.status === 0 && env.status !== "failed" && Array.isArray(env.evidence) && env.evidence.length > 0, latency_ms: dur, quality });
     // 🔴 只有"真取到了"才写快照。判据取信封自己的 status 与证据条数 ——
     //    `failed` 或一条证据都没有,就是这次没取到,别让它变成用户下次打开看到的东西。
     const snap = writeSnapshot(ctx.dataRoot, snapKey, { endpoint: ep.id, symbol }, result, (r) => {
@@ -767,7 +778,7 @@ export interface PageBlockResult {
   status: "ok" | "partial" | "failed" | "missing";
   /** 取不到时说清是什么问题(界面要显示,不能只留空白) */
   error?: string;
-  fetched_at?: string; cached?: boolean;
+  fetched_at?: string; cached?: boolean; quality?: FetchQuality;
   /**
    * 这一块允许用户改的参数键 + 当前生效值。
    * 🔴 界面**照它渲染选择器**,不自己写死一份可选项 —— 写死的那份迟早与后端对不上,
@@ -912,7 +923,7 @@ export async function pageQuery(
         });
         const userArgs = b.userArgs?.length ? { user_args: b.userArgs, applied_args: { ...(b.args ?? {}), ...used } } : {};
         const st = blockStatusFromEnvelope(r.envelope);
-        return { id: b.id, title: b.title, ...(b.note ? { note: b.note } : {}), ...(b.collapsed ? { collapsed: true } : {}), ...userArgs, status: st, fetched_at: r.fetched_at, cached: r.cached, envelope: r.envelope };
+        return { id: b.id, title: b.title, ...(b.note ? { note: b.note } : {}), ...(b.collapsed ? { collapsed: true } : {}), ...userArgs, status: st, fetched_at: r.fetched_at, cached: r.cached, quality: r.quality, envelope: r.envelope };
       } catch (e) {
         // 一块取不到不该让整屏空白 —— 但也**不能装作没事**:如实标出来
         return { id: b.id, title: b.title, ...(b.note ? { note: b.note } : {}), status: "missing", error: e instanceof Error ? e.message : String(e) };
@@ -1180,6 +1191,11 @@ export function thermoSeries(ctx: ServiceContext, endpoint: string): {
   if (!read) throw new ServiceError("no_series", "当前垂类不提供观测序列");
   const r = read(ctx.dataRoot, endpoint);
   return { endpoint, observations: r.observations, exists: r.exists, unreadable: r.unreadable, dropped: r.dropped };
+}
+
+/** Process-local, secret-free fetch telemetry for health pages and operational checks. */
+export function runtimeMetrics(ctx: ServiceContext): ReturnType<typeof fetchMetricsSnapshot> {
+  return fetchMetricsSnapshot(ctx.dataRoot);
 }
 
 export function ledgerSnapshot(ctx: ServiceContext): {
