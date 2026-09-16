@@ -16,11 +16,12 @@ import path from "node:path";
 
 import crypto from "node:crypto";
 
-import { IMPORT_MAX_TOTAL_BYTES, ServiceError, chatSend, llmProbe, translateHeadlines, evidenceAlerts, guidedToolTurn, listTools, runToolRequest, fetchEndpoint, ingestFiles, debateAdvance, debateStart, ledgerKinds, ledgerLabels, ledgerList, localAgents, productInfo, ledgerRemove, ledgerSnapshot, ledgerUpsert, pageQuery, getEvidence, getReport, knowledgeRecall, listEndpoints, listRuns, readRunFile, redact, reportDelete, reportDownload, reportPreview, reportUpload, reportsList, researchStatus, safePath, serviceContext, startCodexSubscriptionLogin, startResearch, thermoSeries, type ServiceContext } from "./service.ts";
+import { IMPORT_MAX_TOTAL_BYTES, ServiceError, chatSend, llmProbe, translateHeadlines, evidenceAlerts, guidedToolTurn, listTools, runToolRequest, fetchEndpoint, ingestFiles, debateAdvance, debateStart, ledgerKinds, ledgerLabels, ledgerList, localAgents, productInfo, ledgerRemove, ledgerSnapshot, ledgerUpsert, pageQuery, getEvidence, getReport, knowledgeRecall, listEndpoints, listRuns, readRunFile, redact, reportDelete, reportDownload, reportPreview, reportUpload, reportsList, researchStatus, runtimeMetrics, safePath, serviceContext, startCodexSubscriptionLogin, startResearch, thermoSeries, type ServiceContext } from "./service.ts";
 import { REPORT_MAX_BYTES } from "./report_library.ts";
 import { NOFOLLOW_FLAG, restrictPrivateFile } from "./fsutil.ts";
 import { resumeUnifiedTask, runUnifiedTask } from "./task_service.ts";
 import { deepTargetResolverFor } from "./deep_target_registry.ts";
+import { US_QUOTE_SOURCES, withFallback, type CircuitState } from "./finance/source_resilience.ts";
 
 
 // **composition root**:插件在入口注册,Core 模块一律不 import 它
@@ -28,6 +29,31 @@ import { deepTargetResolverFor } from "./deep_target_registry.ts";
 import "./finance/register_tasks.ts";
 import { VIEWER_CSP } from "./viewer.ts";
 const MAX_BODY = 256 * 1024;
+const usQuoteCircuits = new Map<string, Record<string, CircuitState>>();
+
+async function fetchUsTechQuote(ctx: ServiceContext, body: Record<string, unknown>, signal: AbortSignal): Promise<Record<string, unknown>> {
+  const extra = Object.keys(body).filter((key) => !["symbol", "session"].includes(key));
+  if (extra.length) throw new ServiceError("bad_request", `美股行情入口不接受字段:${extra.join(", ")}`);
+  const symbol = String(body.symbol ?? "");
+  const states = usQuoteCircuits.get(ctx.dataRoot) ?? {};
+  usQuoteCircuits.set(ctx.dataRoot, states);
+  const selected = await withFallback(US_QUOTE_SOURCES, states, async (source) => {
+    const result = await fetchEndpoint(ctx, {
+      endpoint: source.id,
+      symbol,
+      session: String(body.session ?? "us-tech"),
+      timeout_ms: source.timeoutMs,
+      consistency: { mode: "fresh" },
+      signal,
+    });
+    const evidence = Array.isArray(result.envelope.evidence) ? result.envelope.evidence : [];
+    if (result.exit_code !== 0 || result.envelope.status === "failed" || evidence.length === 0) {
+      throw new ServiceError("source_failed", `${source.id} 未返回可用证据`);
+    }
+    return result;
+  });
+  return { source: selected.source, attempts: selected.attempts, circuits: { ...states }, result: selected.value };
+}
 
 function send(res: http.ServerResponse, code: number, body: unknown, type = "application/json; charset=utf-8", htmlCsp = HTML_CSP): void {
   const data = typeof body === "string" ? body : JSON.stringify(body);
@@ -134,7 +160,9 @@ function cookieToken(req: http.IncomingMessage): string | null {
 
 function uiIndex(ctx: ServiceContext): string {
   const rows = listRuns(ctx, 200).map((r) => `<tr><td><a href="/ui/runs/${esc(r.run_id)}">${esc(r.run_id)}</a></td><td>${esc(r.symbol)}</td><td><span class="tag ${esc(r.status)}">${esc(r.status)}</span></td><td>${esc(r.started_at)}</td><td>${esc(r.finished_at)}</td><td><a href="/runs/${esc(r.run_id)}/viewer">查看器</a></td></tr>`).join("");
-  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Vibe Research · 运行列表</title><style>${UI_CSS}</style></head><body><header><h1>Vibe Research Agent · 运行列表</h1><div>本机只读页面;本页不提供任何投资动作建议。</div></header><main><table><thead><tr><th>run_id</th><th>主体</th><th>状态</th><th>开始</th><th>结束</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="6">(尚无运行;用 node orchestrator/src/run.ts 跑一次)</td></tr>'}</tbody></table></main></body></html>`;
+  const metrics = runtimeMetrics(ctx).totals;
+  const quality = `<p>数据请求 ${metrics.requests} · 成功 ${metrics.successes} · 失败 ${metrics.failures} · 缓存命中率 ${(metrics.cache_hit_ratio * 100).toFixed(1)}% · 平均延迟 ${metrics.average_latency_ms} ms</p>`;
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>Vibe Research · 运行列表</title><style>${UI_CSS}</style></head><body><header><h1>Vibe Research Agent · 运行列表</h1><div>本机只读页面;本页不提供任何投资动作建议。</div></header><main><h2>数据运行状态</h2>${quality}<table><thead><tr><th>run_id</th><th>主体</th><th>状态</th><th>开始</th><th>结束</th><th></th></tr></thead><tbody>${rows || '<tr><td colspan="6">(尚无运行;用 node orchestrator/src/run.ts 跑一次)</td></tr>'}</tbody></table></main></body></html>`;
 }
 
 function uiRun(ctx: ServiceContext, id: string): string | null {
@@ -188,7 +216,8 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
       if (req.method === "GET" && /^\/ui\/runs\/[^/]+$/.test(url.pathname)) { const t = uiRun(ctx, decodeURIComponent(url.pathname.split("/")[3])); return t === null ? send(res, 404, { error: "no such run" }) : send(res, 200, t, "text/html; charset=utf-8"); }
       const parts = url.pathname.split("/").filter(Boolean);
       const q = Object.fromEntries(url.searchParams.entries());
-      if (req.method === "GET" && url.pathname === "/health") return send(res, 200, { ok: true, version: productVersion() });
+      if (req.method === "GET" && url.pathname === "/health") return send(res, 200, { ok: true, version: productVersion(), data: runtimeMetrics(ctx).totals });
+      if (req.method === "GET" && url.pathname === "/metrics") return send(res, 200, runtimeMetrics(ctx));
       // 设置页要看的有效配置。**只读** —— 不提供任何写入密钥的入口(见 service.productInfo)
       if (req.method === "GET" && url.pathname === "/product") return send(res, 200, productInfo(ctx));
       if (req.method === "GET" && url.pathname === "/local-agents") return send(res, 200, await localAgents(ctx, process.env, url.searchParams.get('provider') ?? undefined));
@@ -252,6 +281,9 @@ export function createApiServer(ctx: ServiceContext, opts: { token: string; cook
           const b = await readBody(req);
           return send(res, 200, await fetchEndpoint(ctx, { ...b, signal } as never));
         });
+      }
+      if (req.method === "POST" && url.pathname === "/us-tech/quote") {
+        return await withRequestAbort(req, res, async (signal) => send(res, 200, await fetchUsTechQuote(ctx, await readBody(req), signal)));
       }
       // 统一任务入口：客户端只提交高层 task；路由器自行决定 deterministic / Quick / Deep。
       // Deep 只经适配器启动既有六阶段编排；旧 /research 保持兼容。

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { assessQuality, deduplicate, mergeIncremental, relativeSpread, type Observation } from "../src/finance/data_quality.ts";
-import { isTradingDay, marketDate, toUtcIso } from "../src/finance/market_time.ts";
+import { isTradingDay, isUsTradingDay, marketDate, toUtcIso, usMarketHolidays } from "../src/finance/market_time.ts";
 import { US_QUOTE_SOURCES, rankedSources, recordResult, withFallback } from "../src/finance/source_resilience.ts";
 import { AI_CAPEX_FIELDS, COMPANY_EVENT_ENTRIES, US_TECH_INSTRUMENTS } from "../src/finance/us_tech_monitor.ts";
 
@@ -13,6 +13,10 @@ test("统一 UTC、市场时区与交易日", () => {
   assert.equal(isTradingDay("2026-09-15"), true);
   assert.equal(isTradingDay("2026-09-19"), false);
   assert.equal(isTradingDay("2026-09-15", new Set(["2026-09-15"])), false);
+  assert.equal(isUsTradingDay("2026-04-03"), false); // Good Friday
+  assert.equal(isUsTradingDay("2026-11-26"), false); // Thanksgiving
+  assert.equal(isUsTradingDay("2026-11-27"), true);
+  assert.ok(usMarketHolidays(2026).has("2026-06-19"));
 });
 
 test("去重、增量覆盖、跨源冲突与质量分", () => {
